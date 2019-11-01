@@ -8,6 +8,7 @@
  */
 
 #include "fasttext.h"
+#include "shmem_matrix.h"
 
 #include <math.h>
 
@@ -25,6 +26,14 @@
 namespace fasttext {
 
 FastText::FastText() : quant_(false) {}
+
+std::vector<std::string> FastText::getVocab() {
+  return dict_->getVocab();
+}
+
+std::vector<int64_t> FastText::getUnigramsCounts() {
+  return dict_->getCounts(entry_type::word);
+}
 
 void FastText::getVector(Vector& vec, const std::string& word) const {
   const std::vector<int32_t>& ngrams = dict_->getNgrams(word);
@@ -91,6 +100,40 @@ void FastText::signModel(std::ostream& out) {
   out.write((char*)&(version), sizeof(int32_t));
 }
 
+void FastText::saveDict() {
+  std::string fn(args_->output);
+  std::ofstream ofs(fn, std::ofstream::binary);
+  if (!ofs.is_open()) {
+    std::cerr << "Model file cannot be opened for saving!" << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  args_->save(ofs);
+  dict_->save(ofs);
+  ofs.close();
+}
+
+void FastText::loadDict(const std::string& filename) {
+  std::ifstream ifs(filename, std::ifstream::binary);
+  if (!ifs.is_open()) {
+    std::cerr << "Model file cannot be opened for loading!" << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  if (!checkModel(ifs)) {
+    std::cerr << "Model file has wrong file format!" << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  loadDict(ifs);
+  ifs.close();
+}
+
+void FastText::loadDict(std::istream& in) {
+  args_ = std::make_shared<Args>();
+  dict_ = std::make_shared<Dictionary>(args_);
+
+  args_->load(in);
+  dict_->load(in);
+}
+
 void FastText::saveModel() {
   std::string fn(args_->output);
   if (quant_) {
@@ -124,7 +167,42 @@ void FastText::saveModel() {
   ofs.close();
 }
 
-void FastText::loadModel(const std::string& filename) {
+void FastText::saveModel(int32_t checkpoint) {
+  std::string fn(args_->output + "_Chk" + std::to_string(checkpoint) + ".ckpt");
+  if (quant_) {
+    fn += ".ftz";
+  } else {
+    fn += ".bin";
+  }
+  std::ofstream ofs(fn, std::ofstream::binary);
+  if (!ofs.is_open()) {
+    std::cerr << "Model file cannot be opened for saving!" << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  signModel(ofs);
+  args_->save(ofs);
+  dict_->save(ofs);
+
+  ofs.write((char*)&(quant_), sizeof(bool));
+  if (quant_) {
+    qinput_->save(ofs);
+  } else {
+    input_->save(ofs);
+  }
+
+  ofs.write((char*)&(args_->qout), sizeof(bool));
+  if (quant_ && args_->qout) {
+    qoutput_->save(ofs);
+  } else {
+    output_->save(ofs);
+  }
+
+  ofs.close();
+}
+
+void FastText::loadModel(const std::string& filename,
+                         const bool inference_mode /* = false */,
+                         const int timeout_sec /* = -1 */) {
   std::ifstream ifs(filename, std::ifstream::binary);
   if (!ifs.is_open()) {
     std::cerr << "Model file cannot be opened for loading!" << std::endl;
@@ -134,7 +212,11 @@ void FastText::loadModel(const std::string& filename) {
     std::cerr << "Model file has wrong file format!" << std::endl;
     exit(EXIT_FAILURE);
   }
-  loadModel(ifs);
+  if (inference_mode) {
+    loadModelForInference(ifs, filename, timeout_sec);
+  } else {
+    loadModel(ifs);
+  }
   ifs.close();
 }
 
@@ -168,6 +250,49 @@ void FastText::loadModel(std::istream& in) {
   model_ = std::make_shared<Model>(input_, output_, args_, 0);
   model_->quant_ = quant_;
   model_->setQuantizePointer(qinput_, qoutput_, args_->qout);
+
+  if (args_->model == model_name::sup) {
+    model_->setTargetCounts(dict_->getCounts(entry_type::label));
+  } else {
+    model_->setTargetCounts(dict_->getCounts(entry_type::word));
+  }
+}
+
+static std::string basename(const std::string& filename) {
+  std::string s = filename;
+  size_t separator_idx = s.find_last_of("\\/");
+  if (separator_idx != std::string::npos) {
+    s.erase(0, separator_idx + 1);
+  }
+  size_t extension_idx = s.rfind('.');
+  if (extension_idx != std::string::npos) {
+    s.erase(extension_idx);
+  }
+  return s;
+}
+
+void FastText::loadModelForInference(std::istream& in,
+                                     const std::string& filename,
+                                     const int timeout_sec) {
+  std::string shmem_name = "s2v_" + basename(filename) + "_input_matrix";
+
+  args_ = std::make_shared<Args>();
+  args_->load(in);
+
+  dict_ = std::make_shared<Dictionary>(args_);
+  dict_->load(in);
+
+  in.read((char*) &quant_, sizeof(bool));
+
+  input_ = ShmemMatrix::load(in, shmem_name, timeout_sec);
+
+  in.read((char*) &args_->qout, sizeof(bool));
+
+  output_ = std::make_shared<Matrix>();
+  in.read((char*) &(output_->m_), sizeof(int64_t));
+  in.read((char*) &(output_->n_), sizeof(int64_t));
+
+  model_ = std::make_shared<Model>(input_, output_, args_, 0);
 
   if (args_->model == model_name::sup) {
     model_->setTargetCounts(dict_->getCounts(entry_type::label));
@@ -263,6 +388,21 @@ void FastText::supervised(Model& model, real lr,
   model.update(line, labels[i], lr);
 }
 
+void FastText::skipgram(Model& model, real lr,
+                        const std::vector<int32_t>& line) {
+  std::uniform_int_distribution<> uniform(1, args_->ws);
+  for (int32_t w = 0; w < line.size(); w++) {
+    int32_t boundary = uniform(model.rng);
+    const std::vector<int32_t>& ngrams = dict_->getNgrams(line[w]);
+    for (int32_t c = -boundary; c <= boundary; c++) {
+      if (c != 0 && w + c >= 0 && w + c < line.size()) {
+        model.update(ngrams, line[w + c], lr);
+      }
+    }
+  }
+}
+
+
 void FastText::cbow(Model& model, real lr,
                     const std::vector<int32_t>& line) {
   std::vector<int32_t> bow;
@@ -280,19 +420,42 @@ void FastText::cbow(Model& model, real lr,
   }
 }
 
-void FastText::skipgram(Model& model, real lr,
-                        const std::vector<int32_t>& line) {
+
+void FastText::cbowCWNgrams(Model& model, real lr, std::vector<int32_t>& line){
+  if (line.size() <= 1) return;
+  std::vector<int32_t> subsLine, sidx2lidx;
+  subsLine.reserve(line.size());
+  sidx2lidx.reserve(line.size());
+  std::uniform_real_distribution<> uniformSub(0, 1);
+  for (int32_t i=0; i < line.size(); ++i) {
+    if (uniformSub(model.rng) > dict_->getPDiscard(line[i]) || dict_->getTokenCount(line[i]) < args_->minCountLabel) {
+      continue;
+    }
+    subsLine.push_back(line[i]);
+    sidx2lidx.push_back(i);
+  }
+  std::vector<int32_t> bow;
   std::uniform_int_distribution<> uniform(1, args_->ws);
-  for (int32_t w = 0; w < line.size(); w++) {
+  for (int32_t w = 0; w < subsLine.size(); w++) {
     int32_t boundary = uniform(model.rng);
-    const std::vector<int32_t>& ngrams = dict_->getNgrams(line[w]);
+    bow.clear();
     for (int32_t c = -boundary; c <= boundary; c++) {
-      if (c != 0 && w + c >= 0 && w + c < line.size()) {
-        model.update(ngrams, line[w + c], lr);
+      if (c != 0 && w + c >= 0 && w + c < subsLine.size()) {
+        const std::vector<int32_t>& ngrams = dict_->getNgrams(subsLine[w + c]);
+        bow.insert(bow.end(), ngrams.cbegin(), ngrams.cend());
       }
     }
+    int32_t start = std::max(0, w - boundary);
+    int32_t end = std::min(int32_t(subsLine.size())-1, w + boundary);
+    if (start == end) continue;
+    int32_t buff = line[sidx2lidx[w]];
+    line[sidx2lidx[w]] = 0;
+    dict_->addNgrams(bow, line, sidx2lidx[start], sidx2lidx[end], args_->wordNgrams, args_->dropoutK, model.rng); // add word ngrams to bow
+    line[sidx2lidx[w]] = buff;
+    model.update(bow, subsLine[w], lr, args_->boostNgrams, dict_->nwords(), dict_->nwords() + args_->bucket);
   }
 }
+
 
 void FastText::sent2vec(Model& model, real lr, const std::vector<int32_t>& line){
   if (line.size() <= 1) return;
@@ -457,45 +620,68 @@ void FastText::textVectors(std::vector<std::string>& sentences, int num_threads,
   memcpy(&final[0], &emb->data_[0], emb->m_*emb->n_ * sizeof(real));
 }
 
+void FastText::getVector(Vector& vec, int32_t wordIdx) const {
+  const std::vector<int32_t>& ngrams = dict_->getNgrams(wordIdx);
+  vec.zero();
+  for (auto it = ngrams.begin(); it != ngrams.end(); ++it) {
+    vec.addRow(*input_, *it);
+  }
+  if (ngrams.size() > 0) {
+    vec.mul(1.0 / ngrams.size());
+  }
+}
+
 void FastText::textVector(std::string text, Vector& vec, std::vector<int32_t>& line, std::vector<int32_t>& labels) {
   std::istringstream text_stream(text);
   dict_->getLine(text_stream, line, labels, model_->rng);
   vec.zero();
-  if (args_->model == model_name::sent2vec){
-    dict_->addNgrams(line, args_->wordNgrams);
+  if (args_->model == model_name::cbowCWNgrams){
+    Vector buff(args_->dim);
+    for (int i=0; i< line.size(); ++i) {
+        getVector(buff, line[i]);
+        vec.addVector(buff);
+    }
+    if (!line.empty()) {
+      vec.mul(1.0 / line.size());
+    }
+  } else {
+    if (args_->model == model_name::sent2vec){
+      dict_->addNgrams(line, args_->wordNgrams);
+    }
+    for (auto it = line.cbegin(); it != line.cend(); ++it) {
+      vec.addRow(*input_, *it);
+    }
+    if (!line.empty()) {
+      vec.mul(1.0 / line.size());
+    }
   }
-  for (auto it = line.cbegin(); it != line.cend(); ++it) {
-    vec.addRow(*input_, *it);
-  }
-  if (!line.empty()) {
-    vec.mul(1.0 / line.size());
-  }
-}
-
-void FastText::textVector(std::string text, std::vector<real>& emb) {
-  std::vector<int32_t> line, labels;
-  Vector vec(args_->dim);
-  std::istringstream text_stream(text);
-  dict_->getLine(text_stream, line, labels, model_->rng);
-  vec.zero();
-  if (args_->model == model_name::sent2vec){
-    dict_->addNgrams(line, args_->wordNgrams);
-  }
-  for (auto it = line.cbegin(); it != line.cend(); ++it) {
-    vec.addRow(*input_, *it);
-  }
-  if (!line.empty()) {
-    vec.mul(1.0 / line.size());
-  }
-  emb.insert(emb.end(), &vec.data_[0], &vec.data_[args_->dim]);
 }
 
 void FastText::printWordVectors() {
   wordVectors();
 }
 
+void FastText::printVocabularyVectors(bool input_matrix) {
+  std::vector<std::string> words = getVocab();
+  std::shared_ptr<Matrix> matrix = input_matrix ? input_ : output_;
+  Vector vec(args_->dim);
+  std::string word;
+  for(int i = 0; i < words.size(); i++) {
+    word = words[i];
+    const std::vector<int32_t> &ngrams = dict_->getNgrams(word);
+    vec.zero();
+    for (auto it = ngrams.begin(); it != ngrams.end(); ++it) {
+      vec.addRow(*matrix, *it);
+    }
+    if (ngrams.size() > 0) {
+      vec.mul(1.0 / ngrams.size());
+    }
+    std::cout << word << " " << " " << vec << std::endl;
+  }
+}
+
 void FastText::printSentenceVectors() {
-  if (args_->model == model_name::sup || args_->model == model_name::sent2vec) {
+  if (args_->model == model_name::sup || args_->model == model_name::sent2vec || args_->model == model_name::cbowCWNgrams) {
     textVectors();
   } else {
     sentenceVectors();
@@ -523,7 +709,7 @@ void FastText::precomputeSentenceVectors(Matrix& sentenceVectors,std::ifstream& 
   std::vector<int32_t> labels;
   int32_t i = 0;
   while (i < sentenceVectors.m_) {
-  
+
     dict_->getLine(in, line, labels, model_->rng);
     dict_->addNgrams(line, args_->wordNgrams);
 
@@ -567,7 +753,7 @@ void FastText::findNN(const Matrix& wordVectors, const Vector& queryVec,
 }
 
 void FastText::findNNSent(const Matrix& sentenceVectors, const Vector& queryVec,
-                          int32_t k, const std::set<std::string>& banSet, int64_t numSent, 
+                          int32_t k, const std::set<std::string>& banSet, int64_t numSent,
                           const std::vector<std::string>& sentences) {
   real queryNorm = queryVec.norm();
   if (std::abs(queryNorm) < 1e-8) {
@@ -586,8 +772,8 @@ void FastText::findNNSent(const Matrix& sentenceVectors, const Vector& queryVec,
   while (i < k && heap.size() > 0) {
     auto it = banSet.find(heap.top().second);
     if (!std::isnan(heap.top().first)) {
-      std::cout << heap.top().first << " " 
-                                    << heap.top().second << " " 
+      std::cout << heap.top().first << " "
+                                    << heap.top().second << " "
                                     << std::endl;
       i++;
     }
@@ -640,7 +826,7 @@ void FastText::analogies(int32_t k) {
   }
 }
 
-void FastText::nnSent(int32_t k, std::string filename) {  
+void FastText::nnSent(int32_t k, std::string filename) {
   std::string sentence;
   std::ifstream in1(filename);
   int64_t n = 0;
@@ -686,15 +872,15 @@ void FastText::nnSent(int32_t k, std::string filename) {
 void FastText::analogiesSent(int32_t k, std::string filename) {
   std::string sentence;
   std::ifstream in1(filename);
-  int64_t n = 0;   
-  
+  int64_t n = 0;
+
   Vector buffer(args_->dim), query(args_->dim);
   std::vector<std::string> sentences;
-  
+
   std::vector<int32_t> line, labels;
 
   std::ifstream in2(filename);
-  
+
   while (in2.peek() != EOF) {
     std::getline(in2, sentence);
     sentences.push_back(sentence);
@@ -754,7 +940,7 @@ void FastText::analogiesSent(int32_t k, std::string filename) {
 void FastText::trainThread(int32_t threadId) {
   std::ifstream ifs(args_->input);
   utils::seek(ifs, threadId * utils::size(ifs) / args_->thread);
-
+  int32_t currCheckPoint = 0;
   Model model(input_, output_, args_, threadId);
   if (args_->model == model_name::sup) {
     model.setTargetCounts(dict_->getCounts(entry_type::label));
@@ -773,6 +959,8 @@ void FastText::trainThread(int32_t threadId) {
       supervised(model, lr, line, labels);
     } else if (args_->model == model_name::sent2vec) {
       sent2vec(model, lr, line);
+    } else if (args_->model == model_name::cbowCWNgrams) {
+      cbowCWNgrams(model, lr, line);
     } else if (args_->model == model_name::cbow) {
       cbow(model, lr, line);
     } else if (args_->model == model_name::sg) {
@@ -784,6 +972,14 @@ void FastText::trainThread(int32_t threadId) {
       if (threadId == 0 && args_->verbose > 1) {
         printInfo(progress, model.getLoss());
       }
+    }
+    if (threadId == 0 && currCheckPoint != (int)(progress*args_->numCheckPoints)) {
+      currCheckPoint++;
+      printInfo(progress, model.getLoss());
+      std::cerr << std::endl;
+      std::cerr<<"Saving Model ----- Checkpoint "<< currCheckPoint<< std::endl;
+      model_ = std::make_shared<Model>(input_, output_, args_, 0);
+      saveModel(currCheckPoint);
     }
   }
   if (threadId == 0 && args_->verbose > 0) {
@@ -833,9 +1029,8 @@ void FastText::loadVectors(std::string filename) {
   }
 }
 
-void FastText::train(std::shared_ptr<Args> args) {
-  args_ = args;
-  dict_ = std::make_shared<Dictionary>(args_);
+void FastText::savedDictTrain(std::shared_ptr<Args> args) {
+  loadDict(args_->dict);
   if (args_->input == "-") {
     // manage expectations
     std::cerr << "Cannot use stdin for training!" << std::endl;
@@ -879,7 +1074,79 @@ void FastText::train(std::shared_ptr<Args> args) {
   model_ = std::make_shared<Model>(input_, output_, args_, 0);
 
   saveModel();
-  if (args_->model != model_name::sup && args_->model != model_name::sent2vec) {
+  if (args_->model != model_name::sup && args_->model != model_name::sent2vec && args_->model != model_name::cbowCWNgrams) {
+    saveVectors();
+    if (args_->saveOutput > 0) {
+      saveOutput();
+    }
+  }
+}
+
+void FastText::trainDict(std::shared_ptr<Args> args) {
+  args_ = args;
+  dict_ = std::make_shared<Dictionary>(args_);
+  if (args_->input == "-") {
+    // manage expectations
+    std::cerr << "Cannot use stdin for training!" << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  std::ifstream ifs(args_->input);
+  if (!ifs.is_open()) {
+    std::cerr << "Input file cannot be opened!" << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  dict_->readFromFile(ifs);
+  saveDict();
+  ifs.close();
+}
+
+void FastText::train(std::shared_ptr<Args> args) {
+  args_ = args;
+  dict_ = std::make_shared<Dictionary>(args_);
+  if (args_->input == "-") {
+    // manage expectations
+    std::cerr << "Cannot use stdin for training!" << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  std::ifstream ifs(args_->input);
+  if (!ifs.is_open()) {
+    std::cerr << "Input file cannot be opened!" << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  dict_->readFromFile(ifs);
+  ifs.close();
+
+  if (args_->pretrainedVectors.size() != 0) {
+    loadVectors(args_->pretrainedVectors);
+  } else {
+    input_ = std::make_shared<Matrix>(dict_->nwords()+args_->bucket+args_->bucketChar, args_->dim);
+    input_->uniform(1.0 / args_->dim);
+  }
+
+  if (args_->model == model_name::sup) {
+    output_ = std::make_shared<Matrix>(dict_->nlabels(), args_->dim);
+  } else {
+    output_ = std::make_shared<Matrix>(dict_->nwords(), args_->dim);
+  }
+  output_->zero();
+
+  start = clock();
+  tokenCount = 0;
+  if (args_->thread > 1) {
+    std::vector<std::thread> threads;
+    for (int32_t i = 0; i < args_->thread; i++) {
+      threads.push_back(std::thread([=]() { trainThread(i); }));
+    }
+    for (auto it = threads.begin(); it != threads.end(); ++it) {
+      it->join();
+    }
+  } else {
+    trainThread(0);
+  }
+  model_ = std::make_shared<Model>(input_, output_, args_, 0);
+
+  saveModel();
+  if (args_->model != model_name::sup && args_->model != model_name::sent2vec && args_->model != model_name::cbowCWNgrams) {
     saveVectors();
     if (args_->saveOutput > 0) {
       saveOutput();
